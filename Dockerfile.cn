@@ -1,0 +1,176 @@
+# =============================================================================
+# wg-easy —— 国内网络环境构建版（本 fork 附带，非上游文件）
+# =============================================================================
+# 与仓库根目录的官方 Dockerfile 相比，只改两类东西：
+#   A. 外部资源地址（5 类源全部换成国内，见下）
+#   B. 把官方那个约 400 秒的大 RUN 拆成 4 层，让网络类失败只重跑出问题的那一层
+# 构建参数、产物路径、CMD/ENV/HEALTHCHECK 与官方完全一致。
+#
+# 每一项都能单独退回官方源：
+#   GH_PROXY=                                      -> 直连 github.com
+#   NPM_REGISTRY=https://registry.npmjs.org        -> 官方 npm
+#   APK_MIRROR=                                    -> 不换源（保留 dl-cdn.alpinelinux.org）
+#   GOPROXY_URL=https://proxy.golang.org,direct    -> 官方 Go 代理
+#   NODE_IMAGE=docker.io/library/node:krypton-alpine   -> 官方基础镜像（默认值就是官方）
+#
+# 用法（build context 必须是仓库根目录）：
+#   docker build -f Dockerfile.cn -t wg-easy:custom .
+#
+#   ✗ 错误：cd src && docker build ..     —— 会找不到 package.json / 构建上下文错位
+# =============================================================================
+
+ARG NODE_IMAGE=docker.io/library/node:krypton-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
+
+# -----------------------------------------------------------------------------
+# Stage 1: 前端构建 + 编译 amneziawg
+# -----------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS build
+
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ARG GH_PROXY=
+# 多级回退：第一个不通自动试第二个，逗号分隔（Go 1.13+ 语义）。
+# 只写一个地址的话，那个站一旦抽风构建就整体失败。
+ARG GOPROXY_URL=https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,direct
+
+WORKDIR /app
+
+# --- npm / pnpm -------------------------------------------------------------
+# npm config set --global 会写进 $PREFIX/etc/npmrc，pnpm 也读这个文件；
+# 下一层再显式传一次 NPM_CONFIG_REGISTRY 做双保险。
+# COREPACK_NPM_REGISTRY 只影响 corepack 下载 pnpm 本身的那次请求。
+# COREPACK_INTEGRITY_KEYS=0：npmmirror 的 packument 可能缺 dist.signatures，
+# 不关掉会报 "Cannot find matching keyid"。
+RUN npm install --global corepack@latest --registry=${NPM_REGISTRY} && \
+    npm config set registry ${NPM_REGISTRY} --global
+
+# Install pnpm
+RUN corepack enable pnpm
+
+# Copy Web UI
+COPY src/package.json src/pnpm-lock.yaml src/pnpm-workspace.yaml ./
+RUN NPM_CONFIG_REGISTRY=${NPM_REGISTRY} \
+    COREPACK_NPM_REGISTRY=${NPM_REGISTRY} \
+    COREPACK_INTEGRITY_KEYS=0 \
+    pnpm install
+
+# Build UI
+COPY src ./
+RUN pnpm build
+
+# renovate: datasource=github-releases depName=amnezia-vpn/amneziawg-tools
+ARG AWGTOOLS_BRANCH=v3.1.20260812
+# renovate: datasource=github-tags depName=amnezia-vpn/amneziawg-go
+ARG AWGGO_BRANCH=v3.1.20260828
+
+# --- Alpine apk 换源 --------------------------------------------------------
+# 只替换 host，版本路径（v3.xx/main）沿用基础镜像自带的，不会串版本。
+ARG APK_MIRROR=mirrors.aliyun.com
+RUN set -eux; \
+    if [ -n "${APK_MIRROR}" ] && [ -f /etc/apk/repositories ]; then \
+        sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories; \
+    fi; \
+    cat /etc/apk/repositories
+
+# 工具链单独一层：这一层约 470 MB / 6 分钟，拆出来后以后改 go/git 相关不会再重跑它
+RUN apk add linux-headers build-base go git
+
+# --- Go 模块代理 ------------------------------------------------------------
+# 官方默认是 proxy.golang.org（Google，国内直连必然 i/o timeout）。
+# GONOSUMDB/GOFLAGS 不动；goproxy.cn 与 aliyun 都代理了 sumdb，无需改 GOSUMDB。
+ENV GOPROXY=${GOPROXY_URL}
+
+# --- GitHub 源码 ------------------------------------------------------------
+# GH_PROXY 是**前缀**式代理：https://ghfast.top/ + https://github.com/... = 完整地址
+# 留空时退化为直连，与官方 Dockerfile 完全一致。
+RUN git clone --depth 1 --branch "${AWGTOOLS_BRANCH}" \
+        "${GH_PROXY}https://github.com/amnezia-vpn/amneziawg-tools.git" && \
+    git clone --depth 1 --branch "${AWGGO_BRANCH}" \
+        "${GH_PROXY}https://github.com/amnezia-vpn/amneziawg-go"
+
+# 依赖单独一层：GOPROXY 改错时只重跑这一层，不用重装工具链、不用重新 clone。
+# 先把生效的 GOPROXY 打出来，排错时一眼能看到。
+RUN go env GOPROXY && cd amneziawg-go && go mod download
+
+# Build amneziawg-tools
+RUN cd amneziawg-go && \
+    make && \
+    cd ../amneziawg-tools/src && \
+    make && \
+    sed -i 's|\[\[ $proto == -4 \]\] && cmd sysctl -q net\.ipv4\.conf\.all\.src_valid_mark=1|[[ $proto == -4 ]] \&\& [[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) != 1 ]] \&\& cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1|' ./wg-quick/linux.bash
+
+# -----------------------------------------------------------------------------
+# Stage 2: 单独装 libsql（避免打进前端构建层）
+# -----------------------------------------------------------------------------
+FROM ${NODE_IMAGE} AS build-libsql
+
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
+WORKDIR /app
+RUN npm install --no-save --omit=dev libsql --registry=${NPM_REGISTRY}
+
+# -----------------------------------------------------------------------------
+# Stage 3: 运行时镜像
+# -----------------------------------------------------------------------------
+FROM ${NODE_IMAGE}
+
+ARG APK_MIRROR=mirrors.aliyun.com
+
+WORKDIR /app
+
+HEALTHCHECK --interval=1m --timeout=5s --retries=3 CMD /usr/bin/timeout 5s /bin/sh -c "/usr/bin/wg show | /bin/grep -q interface || exit 1"
+
+# Copy build
+COPY --from=build /app/.output /app
+# Copy migrations
+COPY --from=build /app/server/database/migrations /app/server/database/migrations
+# libsql (https://github.com/nitrojs/nitro/issues/3328)
+COPY --from=build-libsql /app/node_modules /app/server/node_modules
+
+# cli
+COPY --from=build /app/cli/cli.sh /usr/local/bin/cli
+RUN chmod +x /usr/local/bin/cli
+# Copy amneziawg-go
+COPY --from=build /app/amneziawg-go/amneziawg-go /usr/bin/amneziawg-go
+RUN chmod +x /usr/bin/amneziawg-go
+# Copy amneziawg-tools
+COPY --from=build /app/amneziawg-tools/src/wg /usr/bin/awg
+COPY --from=build /app/amneziawg-tools/src/wg-quick/linux.bash /usr/bin/awg-quick
+RUN chmod +x /usr/bin/awg /usr/bin/awg-quick
+
+# apk 换源（同样只替换 host）
+RUN set -eux; \
+    if [ -n "${APK_MIRROR}" ] && [ -f /etc/apk/repositories ]; then \
+        sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories; \
+    fi
+
+# Install Linux packages
+RUN apk add --no-cache \
+    dpkg \
+    dumb-init \
+    iptables \
+    ip6tables \
+    nftables \
+    kmod \
+    iptables-legacy \
+    wireguard-go \
+    wireguard-tools
+
+RUN mkdir -p /etc/amnezia
+RUN ln -s /etc/wireguard /etc/amnezia/amneziawg
+
+# Use iptables-legacy
+RUN update-alternatives --install /usr/sbin/iptables iptables /usr/sbin/iptables-legacy 10 --slave /usr/sbin/iptables-restore iptables-restore /usr/sbin/iptables-legacy-restore --slave /usr/sbin/iptables-save iptables-save /usr/sbin/iptables-legacy-save
+RUN update-alternatives --install /usr/sbin/ip6tables ip6tables /usr/sbin/ip6tables-legacy 10 --slave /usr/sbin/ip6tables-restore ip6tables-restore /usr/sbin/ip6tables-legacy-restore --slave /usr/sbin/ip6tables-save ip6tables-save /usr/sbin/ip6tables-legacy-save
+
+# Set Environment
+ENV DEBUG=Server,WireGuard,Database,CMD,Firewall
+ENV PORT=51821
+ENV HOST=0.0.0.0
+ENV INSECURE=false
+ENV INIT_ENABLED=false
+ENV DISABLE_IPV6=false
+
+LABEL org.opencontainers.image.source=https://github.com/wg-easy/wg-easy
+
+# Run Web UI
+CMD ["/usr/bin/dumb-init", "node", "server/index.mjs"]
