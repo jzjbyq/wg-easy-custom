@@ -4,3 +4,10 @@ node_modules
 
 docs/site
 docs/.cache
+
+# local fork tooling — not part of the application
+.workbuddy/
+patch-frontend-ui/
+patch-frontend-ui.zip
+build-cn/
+build-cn.zip
