@@ -1,0 +1,12 @@
+# Shell scripts and Dockerfiles run inside Linux containers: force LF.
+#
+# On Windows checkouts with core.autocrlf=true these files are otherwise
+# written with CRLF, which turns a shebang into "#!/bin/sh\r". exec() then
+# looks for an interpreter literally named "/bin/sh\r" and fails with
+#   exec /usr/local/bin/cli: no such file or directory
+# even though the file is present and executable.
+*.sh   text eol=lf
+*.bash text eol=lf
+
+Dockerfile    text eol=lf
+Dockerfile.*  text eol=lf

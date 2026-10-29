@@ -14,10 +14,10 @@
         </PanelHeadBoat>
       </PanelHead>
 
-      <div v-if="clientsStore.clients && clientsStore.clients.length > 0">
-        <ClientsBulkBar />
-        <ClientsList />
-        <ClientsPagination />
+      <div>
+        <ClientsList
+          v-if="clientsStore.clients && clientsStore.clients.length > 0"
+        />
       </div>
       <ClientsEmpty
         v-if="clientsStore.clients && clientsStore.clients.length === 0"
