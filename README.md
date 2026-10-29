@@ -126,7 +126,7 @@ docker build -t wg-easy:custom .
 
 | 参数 | 默认值 | 作用 |
 |---|---|---|
-| `NODE_IMAGE` | `docker.io/library/node:krypton-alpine@sha256:ebfe2f90…` | 基础镜像，可换成私有仓库地址 |
+| `NODE_IMAGE` | `docker.io/library/node:krypton-alpine@sha256:06d7adf3…` | 基础镜像，可换成私有仓库地址 |
 | `NPM_REGISTRY` | `https://registry.npmmirror.com` | npm / pnpm 包源 |
 | `APK_MIRROR` | `mirrors.aliyun.com` | Alpine apk 源，只替换 host，版本路径沿用基础镜像 |
 | `GOPROXY_URL` | `https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,direct` | Go 模块代理，逗号分隔表示多级回退 |
